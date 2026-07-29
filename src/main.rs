@@ -168,10 +168,8 @@ fn main() -> eyre::Result<()> {
     let start = Instant::now();
 
     while let Some(event) = events.recv() {
-        let id = match event {
-            Event::Stop(_) => break,
-            Event::Input { id, .. } => id,
-            _ => continue,
+        let Event::Input { id, .. } = event else {
+            continue;
         };
         if id.as_str() != "tick" {
             continue;
