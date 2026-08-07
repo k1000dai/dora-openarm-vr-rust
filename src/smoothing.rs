@@ -19,6 +19,12 @@
 //! the filter recurrence upgrades position, quaternion and velocity state
 //! to `float64` from the second `smooth()` call onward under numpy 2.x's
 //! type promotion rules, even though the input/output poses are `float32`.
+//!
+//! On top of the filter itself, the smoother optionally caps how fast its
+//! output pose may translate and rotate (upstream's `max_linear_speed` /
+//! `max_angular_speed`), and can be [suspended](OneEuroPoseSmoother::suspend)
+//! -- holding the last filtered pose while clearing its motion state --
+//! instead of [reset](OneEuroPoseSmoother::reset) while a pose is INVALID.
 
 // The `as f32` narrowing at the end of `smooth()` is the deliberate final
 // step of that dtype ladder, matching upstream's explicit
@@ -75,6 +81,23 @@ fn get_alpha(dt: f64, cutoff: f64) -> f64 {
     1.0 / (1.0 + tau / dt)
 }
 
+/// The factor that keeps a per-sample `step` within `maximum`, matching
+/// upstream `_limit_scale`.
+///
+/// A non-positive `maximum` (the caller's limit is `0.0`, or `dt` is
+/// non-positive) disables limiting, as does a non-positive `step`.
+fn limit_scale(step: f64, maximum: f64) -> f64 {
+    if maximum > 0.0 && step > 0.0 {
+        (maximum / step).min(1.0)
+    } else {
+        1.0
+    }
+}
+
+fn norm3(v: [f64; 3]) -> f64 {
+    (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt()
+}
+
 /// One Euro Filter applied to position (adaptive cutoff) and rotation
 /// (SLERP), matching upstream `OneEuroPoseSmoother`.
 ///
@@ -85,6 +108,8 @@ pub struct OneEuroPoseSmoother {
     min_cutoff: f64,
     beta: f64,
     d_cutoff: f64,
+    max_linear_speed: f64,
+    max_angular_speed: f64,
     p_prev: Option<[f64; 3]>,
     q_prev: Option<[f64; 4]>,
     dp_prev: [f64; 3],
@@ -93,13 +118,35 @@ pub struct OneEuroPoseSmoother {
 
 impl OneEuroPoseSmoother {
     /// Builds a smoother with the given minimum cutoff frequency, speed
-    /// coefficient, and derivative cutoff frequency.
+    /// coefficient, and derivative cutoff frequency, and no output speed
+    /// limiting -- upstream's `max_linear_speed=0.0, max_angular_speed=0.0`
+    /// constructor defaults, which is how upstream `_run` builds
+    /// `smoother_reference`.
     #[must_use]
     pub fn new(min_cutoff: f64, beta: f64, d_cutoff: f64) -> Self {
+        Self::with_speed_limits(min_cutoff, beta, d_cutoff, 0.0, 0.0)
+    }
+
+    /// Builds a smoother that additionally caps how fast its *output* pose
+    /// may move: `max_linear_speed` in m/s and `max_angular_speed` in rad/s,
+    /// with `0.0` disabling that limit.
+    ///
+    /// This is how upstream `_run` builds `smoother_right`/`smoother_left`
+    /// from the `--max-linear-speed`/`--max-angular-speed` options.
+    #[must_use]
+    pub fn with_speed_limits(
+        min_cutoff: f64,
+        beta: f64,
+        d_cutoff: f64,
+        max_linear_speed: f64,
+        max_angular_speed: f64,
+    ) -> Self {
         Self {
             min_cutoff,
             beta,
             d_cutoff,
+            max_linear_speed,
+            max_angular_speed,
             p_prev: None,
             q_prev: None,
             dp_prev: [0.0; 3],
@@ -107,14 +154,25 @@ impl OneEuroPoseSmoother {
         }
     }
 
-    /// Clears filter state so the next sample is treated as a fresh start.
-    ///
-    /// Call this on an INVALID -> valid transition of the tracked pose.
+    /// Clears all filter state, so the next sample is treated as a fresh
+    /// start and passes through unfiltered.
     pub fn reset(&mut self) {
         self.p_prev = None;
         self.q_prev = None;
         self.dp_prev = [0.0; 3];
         self.t_prev = None;
+    }
+
+    /// Pauses updates while preserving the last filtered pose, matching
+    /// upstream `suspend`.
+    ///
+    /// The retained position/orientation stay put and only the velocity
+    /// state is cleared, so the next accepted sample resumes filtering from
+    /// the last output (over `t - t_prev`) instead of jumping straight to
+    /// the new target. Call this on every tick a pose is INVALID.
+    pub fn suspend(&mut self, t: f64) {
+        self.dp_prev = [0.0; 3];
+        self.t_prev = Some(t);
     }
 
     /// Smooths `target_pose` sampled at time `t` (seconds, monotonic
@@ -163,19 +221,31 @@ impl OneEuroPoseSmoother {
             alpha_d * dp_raw[2] + (1.0 - alpha_d) * self.dp_prev[2],
         ];
 
-        let speed = (dp_filtered[0] * dp_filtered[0]
-            + dp_filtered[1] * dp_filtered[1]
-            + dp_filtered[2] * dp_filtered[2])
-            .sqrt();
+        let speed = norm3(dp_filtered);
         let cutoff_p = self.min_cutoff + self.beta * speed;
 
         let alpha_p = get_alpha(dt, cutoff_p);
-        let p_hat = [
-            p_prev[0] + alpha_p * (t_p[0] - p_prev[0]),
-            p_prev[1] + alpha_p * (t_p[1] - p_prev[1]),
-            p_prev[2] + alpha_p * (t_p[2] - p_prev[2]),
+        let q_prev = self.q_prev.unwrap_or(t_q);
+
+        // The position/rotation steps the unlimited filter would take, each
+        // scaled down so the output moves no faster than the configured
+        // limit over this `dt`.
+        let step = [
+            alpha_p * (t_p[0] - p_prev[0]),
+            alpha_p * (t_p[1] - p_prev[1]),
+            alpha_p * (t_p[2] - p_prev[2]),
         ];
-        let q_hat = slerp_quat(self.q_prev.unwrap_or(t_q), t_q, alpha_p);
+        let linear_scale = limit_scale(norm3(step), self.max_linear_speed * dt);
+        let p_hat = [
+            p_prev[0] + step[0] * linear_scale,
+            p_prev[1] + step[1] * linear_scale,
+            p_prev[2] + step[2] * linear_scale,
+        ];
+
+        let q_error_angle = 2.0 * dot4(q_prev, t_q).abs().clamp(0.0, 1.0).acos();
+        let rotation_alpha =
+            alpha_p * limit_scale(alpha_p * q_error_angle, self.max_angular_speed * dt);
+        let q_hat = slerp_quat(q_prev, t_q, rotation_alpha);
 
         self.p_prev = Some(p_hat);
         self.q_prev = Some(q_hat);

@@ -17,11 +17,18 @@
 //!
 //! [`TickProcessor`] owns the three One Euro smoothers upstream constructs
 //! once at startup (`smoother_right`, `smoother_left`, `smoother_reference`)
-//! and the previous-validity state used to detect INVALID transitions. It
-//! turns one tick's drained receive timestamps and latest message into the
-//! ordered list of dora outputs to send. It knows nothing about dora-rs,
-//! Arrow, or sockets -- the adapter in `main.rs` walks the returned
-//! [`Emission`]s and sends them.
+//! and the previous overall validity code used to detect INVALID
+//! transitions. It turns one tick's drained receive timestamps and latest
+//! message into the ordered list of dora outputs to send. It knows nothing
+//! about dora-rs, Arrow, or sockets -- the adapter in `main.rs` walks the
+//! returned [`Emission`]s and sends them.
+//!
+//! The two controller poses and the reference pose handle INVALID
+//! differently, matching upstream: a controller smoother is *suspended* on
+//! every INVALID tick (last filtered pose kept, motion state cleared), while
+//! the reference smoother is *reset* once, on the valid -> INVALID
+//! transition, so the first reference sample after recovery passes through
+//! unfiltered.
 //!
 //! Upstream tracks two nominally-separate "previous overall validity"
 //! variables: `prev_v_overall` (gates the validity-change log line) and
@@ -116,36 +123,44 @@ fn emit(emissions: &mut Vec<Emission>, output_id: &'static str, value: EmissionV
 }
 
 /// Per-node processing state: the three One Euro smoothers and the
-/// previous-tick validity codes needed to detect INVALID transitions,
-/// matching the state upstream `_run` keeps in local variables.
+/// previous-tick overall validity code needed to detect INVALID
+/// transitions, matching the state upstream `_run` keeps in local
+/// variables.
 #[derive(Debug, Clone)]
 pub struct TickProcessor {
     smoother_right: OneEuroPoseSmoother,
     smoother_left: OneEuroPoseSmoother,
     smoother_reference: OneEuroPoseSmoother,
-    prev_v_right: i64,
-    prev_v_left: i64,
     prev_overall_validity: i64,
-}
-
-impl Default for TickProcessor {
-    fn default() -> Self {
-        Self::new()
-    }
 }
 
 impl TickProcessor {
     /// Builds a fresh processor with the smoother parameters upstream uses
-    /// in `_run` (`min_cutoff=2.0, beta=0.04, d_cutoff=1.5`) and all
+    /// in `_run` (`min_cutoff=2.0, beta=0.04, d_cutoff=1.5`) and the
     /// previous-validity state at `VALID_OK`.
+    ///
+    /// `max_linear_speed` (m/s) and `max_angular_speed` (rad/s) come from
+    /// the command line and, as upstream, apply only to the two controller
+    /// smoothers -- the reference smoother is always built with upstream's
+    /// unlimited constructor defaults.
     #[must_use]
-    pub fn new() -> Self {
+    pub fn new(max_linear_speed: f64, max_angular_speed: f64) -> Self {
         Self {
-            smoother_right: OneEuroPoseSmoother::new(2.0, 0.04, 1.5),
-            smoother_left: OneEuroPoseSmoother::new(2.0, 0.04, 1.5),
+            smoother_right: OneEuroPoseSmoother::with_speed_limits(
+                2.0,
+                0.04,
+                1.5,
+                max_linear_speed,
+                max_angular_speed,
+            ),
+            smoother_left: OneEuroPoseSmoother::with_speed_limits(
+                2.0,
+                0.04,
+                1.5,
+                max_linear_speed,
+                max_angular_speed,
+            ),
             smoother_reference: OneEuroPoseSmoother::new(2.0, 0.04, 1.5),
-            prev_v_right: VALID_OK,
-            prev_v_left: VALID_OK,
             prev_overall_validity: VALID_OK,
         }
     }
@@ -206,18 +221,14 @@ impl TickProcessor {
             transform::process(msg.get_pose("rf"), msg.get_pose("rc"), msg.get_pose("lc"));
 
         let pose_right = if v_right == VALID_INVALID {
-            if self.prev_v_right != VALID_INVALID {
-                self.smoother_right.reset();
-            }
+            self.smoother_right.suspend(now);
             None
         } else {
             self.smoother_right.smooth(now, outcome.pose_right)
         };
 
         let pose_left = if v_left == VALID_INVALID {
-            if self.prev_v_left != VALID_INVALID {
-                self.smoother_left.reset();
-            }
+            self.smoother_left.suspend(now);
             None
         } else {
             self.smoother_left.smooth(now, outcome.pose_left)
@@ -232,8 +243,6 @@ impl TickProcessor {
             self.smoother_reference.smooth(now, outcome.pose_reference)
         };
 
-        self.prev_v_right = v_right;
-        self.prev_v_left = v_left;
         self.prev_overall_validity = v_overall;
 
         if let (Some(pose), Some(rt)) = (pose_right, msg.get_f64("rt")) {

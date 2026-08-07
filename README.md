@@ -26,6 +26,7 @@ Ports `dora_openarm_vr.quest_receiver`, `.smoothing`, and `.udp_receiver` from u
 - Logs `[receiver] validity: OLD -> NEW (L=..., R=...)` to stdout whenever the overall validity code changes, matching upstream's diagnostic print (not a dora output).
 - Reacts only to `tick` inputs; all other event types (including `Stop`) are ignored the same way upstream's `for event in node: if event["type"] != "INPUT" or event["id"] != "tick": continue` ignores them -- there is no dedicated `STOP` handling on either side.
 - `--host` (default `0.0.0.0`) / `--port` (default `5006`): upstream's `quest_receiver.py` reads these only from `argparse`, with no environment variable fallback, so this port doesn't add one either.
+- `--max-linear-speed` (default `1.0` m/s) and `--max-angular-speed` (default `6.0` rad/s): cap per-tick controller translation/rotation steps after One Euro filtering; pass `0` to disable either limit. Invalid (negative, NaN, or infinity) values are rejected.
 - The UDP background thread is a close port of `JsonUdpReceiver`: it binds (retrying every second on failure), blocks on `recv_from` with a 1 second timeout, and drains any additional already-queued datagrams non-blockingly before waiting again. Only successfully-parsed datagrams update the latest message or the (`maxlen=512`) arrival-timestamp log; unparseable ones are dropped silently. The thread is never joined, matching upstream's daemon thread.
 
 ### Documented deviations from upstream's dynamic typing

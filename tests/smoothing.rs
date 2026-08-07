@@ -38,6 +38,16 @@ fn assert_close7(a: [f32; 7], b: [f32; 7]) {
     }
 }
 
+fn assert_close_scalar(a: f32, b: f32) {
+    assert!((a - b).abs() < EPS, "{a} vs {b}");
+}
+
+/// The distance the output position travelled from `from` to `pose`.
+fn step_norm(pose: [f32; 7], from: [f32; 3]) -> f32 {
+    let d = [pose[0] - from[0], pose[1] - from[1], pose[2] - from[2]];
+    d[0].mul_add(d[0], d[1].mul_add(d[1], d[2] * d[2])).sqrt()
+}
+
 #[test]
 fn smooth_of_none_is_none() {
     let mut sm = OneEuroPoseSmoother::new(1.0, 0.0, 1.0);
@@ -146,7 +156,7 @@ fn golden_sequence_with_speed_dependent_cutoff() {
 
 #[test]
 fn reset_clears_state_so_next_sample_passes_through() {
-    let mut sm = OneEuroPoseSmoother::new(1.0, 0.0, 1.0);
+    let mut sm = OneEuroPoseSmoother::new(2.0, 0.04, 1.5);
     let _ = sm.smooth(0.0, Some([0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0]));
     let _ = sm.smooth(1.0, Some([1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0]));
 
@@ -154,6 +164,252 @@ fn reset_clears_state_so_next_sample_passes_through() {
 
     let pose = [5.0, 5.0, 5.0, 0.0, 0.0, 0.0, 1.0];
     assert_eq!(sm.smooth(2.0, Some(pose)), Some(pose));
+}
+
+#[test]
+fn suspend_keeps_the_last_filtered_pose_and_clears_motion() {
+    let mut sm = OneEuroPoseSmoother::new(2.0, 0.04, 1.5);
+    let _ = sm.smooth(0.0, Some([0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0]));
+    let filtered = sm
+        .smooth(1.0, Some([1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0]))
+        .unwrap();
+    assert_close7(
+        filtered,
+        [0.927_502_572_536_468_5, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0],
+    );
+
+    sm.suspend(2.0);
+
+    // Unlike `reset`, the retained pose keeps filtering from where it was
+    // (0.9275...) over the dt since the suspend, rather than jumping to the
+    // new target.
+    let resumed = sm
+        .smooth(3.0, Some([5.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0]))
+        .unwrap();
+    assert_close7(
+        resumed,
+        [4.718_977_451_324_463, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0],
+    );
+}
+
+#[test]
+fn suspend_before_any_sample_still_lets_the_next_sample_pass_through() {
+    let mut sm = OneEuroPoseSmoother::new(2.0, 0.04, 1.5);
+    sm.suspend(1.0);
+
+    // `suspend` sets only the timestamp; with no retained pose the next
+    // sample is still a fresh start.
+    let pose = [0.25, -0.5, 0.75, 0.0, 0.0, 0.0, 1.0];
+    assert_eq!(sm.smooth(2.0, Some(pose)), Some(pose));
+}
+
+#[test]
+fn golden_linear_speed_limit_caps_a_large_translation_step() {
+    let mut sm = OneEuroPoseSmoother::with_speed_limits(2.0, 0.04, 1.5, 0.5, 0.0);
+
+    sm.smooth(0.0, Some([0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0]))
+        .unwrap();
+
+    // Each 100 ms step may move at most 0.5 m/s * 0.1 s = 0.05 m.
+    let r2 = sm
+        .smooth(0.1, Some([2.0, -1.0, 0.5, 0.0, 0.0, 0.0, 1.0]))
+        .unwrap();
+    assert_close7(
+        r2,
+        [
+            0.043_643_578_886_985_78,
+            -0.021_821_789_443_492_89,
+            0.010_910_894_721_746_445,
+            0.0,
+            0.0,
+            0.0,
+            1.0,
+        ],
+    );
+    assert_close_scalar(step_norm(r2, [0.0, 0.0, 0.0]), 0.05);
+
+    let r3 = sm
+        .smooth(0.2, Some([2.0, -1.0, 0.5, 0.0, 0.0, 0.0, 1.0]))
+        .unwrap();
+    assert_close7(
+        r3,
+        [
+            0.087_287_157_773_971_56,
+            -0.043_643_578_886_985_78,
+            0.021_821_789_443_492_89,
+            0.0,
+            0.0,
+            0.0,
+            1.0,
+        ],
+    );
+    assert_close_scalar(step_norm(r3, [r2[0], r2[1], r2[2]]), 0.05);
+}
+
+#[test]
+fn golden_the_same_translation_is_unclamped_when_the_limit_is_zero() {
+    let mut sm = OneEuroPoseSmoother::new(2.0, 0.04, 1.5);
+
+    sm.smooth(0.0, Some([0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0]))
+        .unwrap();
+
+    let r2 = sm
+        .smooth(0.1, Some([2.0, -1.0, 0.5, 0.0, 0.0, 0.0, 1.0]))
+        .unwrap();
+    assert_close7(
+        r2,
+        [
+            1.211_369_633_674_621_6,
+            -0.605_684_816_837_310_8,
+            0.302_842_408_418_655_4,
+            0.0,
+            0.0,
+            0.0,
+            1.0,
+        ],
+    );
+
+    let r3 = sm
+        .smooth(0.2, Some([2.0, -1.0, 0.5, 0.0, 0.0, 0.0, 1.0]))
+        .unwrap();
+    assert_close7(
+        r3,
+        [
+            1.685_886_025_428_772,
+            -0.842_943_012_714_386,
+            0.421_471_506_357_193,
+            0.0,
+            0.0,
+            0.0,
+            1.0,
+        ],
+    );
+}
+
+#[test]
+fn golden_angular_speed_limit_caps_a_large_rotation_step() {
+    let mut sm = OneEuroPoseSmoother::with_speed_limits(2.0, 0.04, 1.5, 0.0, 0.2);
+
+    sm.smooth(0.0, Some([0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0]))
+        .unwrap();
+
+    // Each 100 ms step may rotate at most 0.2 rad/s * 0.1 s = 0.02 rad.
+    let quarter_turn_z = [0.0, 0.0, 0.0, 0.0, 0.0, 0.707_106_78, 0.707_106_78];
+    let r2 = sm.smooth(0.1, Some(quarter_turn_z)).unwrap();
+    assert_close7(
+        r2,
+        [
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.009_999_833_069_741_726,
+            0.999_949_991_703_033_4,
+        ],
+    );
+
+    let r3 = sm.smooth(0.2, Some(quarter_turn_z)).unwrap();
+    assert_close7(
+        r3,
+        [
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.019_998_665_899_038_315,
+            0.999_800_026_416_778_6,
+        ],
+    );
+}
+
+#[test]
+fn golden_the_same_rotation_is_unclamped_when_the_limit_is_zero() {
+    let mut sm = OneEuroPoseSmoother::new(2.0, 0.04, 1.5);
+
+    sm.smooth(0.0, Some([0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0]))
+        .unwrap();
+
+    let quarter_turn_z = [0.0, 0.0, 0.0, 0.0, 0.0, 0.707_106_78, 0.707_106_78];
+    let r2 = sm.smooth(0.1, Some(quarter_turn_z)).unwrap();
+    assert_close7(
+        r2,
+        [
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.423_548_519_611_358_64,
+            0.905_873_417_854_309_1,
+        ],
+    );
+
+    let r3 = sm.smooth(0.2, Some(quarter_turn_z)).unwrap();
+    assert_close7(
+        r3,
+        [
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.590_088_963_508_606,
+            0.807_338_237_762_451_2,
+        ],
+    );
+}
+
+#[test]
+fn golden_sequence_with_the_upstream_default_speed_limits() {
+    let mut sm = OneEuroPoseSmoother::with_speed_limits(2.0, 0.04, 1.5, 1.0, 6.0);
+
+    sm.smooth(0.0, Some([0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0]))
+        .unwrap();
+
+    // Same inputs as `golden_sequence_with_speed_dependent_cutoff`: at 33 ms
+    // the unlimited step is under 1.0 m/s * 0.033 s, so this sample is
+    // untouched by the limit.
+    let r2 = sm
+        .smooth(
+            0.033,
+            Some([0.050_000_0, -0.02, 0.01, 0.087_155_7, 0.0, 0.0, 0.996_194_7]),
+        )
+        .unwrap();
+    assert_close7(
+        r2,
+        [
+            0.014_737_974,
+            -0.005_895_189,
+            0.002_947_594_5,
+            0.025_719_766,
+            0.0,
+            0.0,
+            0.999_669_2,
+        ],
+    );
+
+    // The next step's unlimited length (0.0344 m) exceeds the 0.033 m budget,
+    // so it is scaled down -- unlike the unlimited golden's 0.046_083_156.
+    let r3 = sm
+        .smooth(
+            0.066,
+            Some([0.12, -0.05, 0.02, 0.173_648_19, 0.0, 0.0, 0.984_807_8]),
+        )
+        .unwrap();
+    assert_close7(
+        r3,
+        [
+            0.044_840_082_526_206_97,
+            -0.018_507_979_810_237_885,
+            0.007_824_123_837_053_776,
+            0.069_978_475_570_678_71,
+            0.0,
+            0.0,
+            0.997_548_520_565_033,
+        ],
+    );
 }
 
 #[test]

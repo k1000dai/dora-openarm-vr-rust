@@ -164,7 +164,7 @@ fn main() -> eyre::Result<()> {
         build_array(EmissionValue::Status("ready")),
     )?;
 
-    let mut tick_processor = TickProcessor::new();
+    let mut tick_processor = TickProcessor::new(args.max_linear_speed, args.max_angular_speed);
     let start = Instant::now();
 
     while let Some(event) = events.recv() {
